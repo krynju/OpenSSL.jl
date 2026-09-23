@@ -632,3 +632,75 @@ end
     @test_throws ErrorException OpenSSL.SSLContext(ssl_method, "does_not_exist")
 
 end
+
+@testset "ConcurrentReadWrite" begin
+    # A write that is waiting for the peer must not stop reads on the same stream:
+    # `SSL_write_ex` and `SSL_read_ex` share `ssl.lock`, so the socket write the write
+    # BIO does has to happen outside it.
+    cert = X509Certificate()
+    key = EvpPKey(rsa_generate_key())
+    cert.public_key = key
+    name = X509Name()
+    add_entry(name, "CN", "localhost")
+    cert.subject_name = name
+    cert.issuer_name = name
+    Dates.adjust(cert.time_not_before, Second(0))
+    Dates.adjust(cert.time_not_after, Year(1))
+    sign_certificate(cert, key)
+
+    server_ctx = OpenSSL.SSLContext(OpenSSL.TLSServerMethod(), "")
+    OpenSSL.ssl_use_certificate(server_ctx, cert)
+    OpenSSL.ssl_use_private_key(server_ctx, key)
+
+    port, server = Sockets.listenany(ip"127.0.0.1", 20000)
+    payload = collect(0x01:0x40)
+    stop = Channel{Nothing}(1)
+    server_task = @async begin
+        sock = accept(server)
+        ssl = OpenSSL.SSLStream(server_ctx, sock)
+        while true
+            try
+                Sockets.accept(ssl)
+                break
+            catch
+                eof(sock) && return
+                sleep(0.01)
+            end
+        end
+        write(ssl, payload)
+        # and from here on the server reads nothing, so the client's write parks
+        take!(stop)
+        close(ssl)
+    end
+
+    client = OpenSSL.SSLStream(OpenSSL.SSLContext(OpenSSL.TLSClientMethod(), ""),
+        Sockets.connect(ip"127.0.0.1", port))
+    Sockets.connect(client; require_ssl_verification=false)
+
+    writer = @async try
+        write(client, zeros(UInt8, 8 * 1024 * 1024))
+    catch ex
+        ex
+    end
+    # give the writer time to fill the peer's receive window and park there
+    sleep(1.0)
+    @test !istaskdone(writer)
+    @test !islocked(client.lock)
+
+    buff = Vector{UInt8}(undef, length(payload))
+    reader = @async try
+        read!(client, buff)
+    catch ex
+        ex
+    end
+    @test timedwait(() -> istaskdone(reader), 30.0) === :ok
+    @test buff == payload
+
+    # the server has to go away first: the client still has 8 MB parked against a peer
+    # that is not reading, so its own close cannot finish until that write fails
+    put!(stop, nothing)
+    @test timedwait(() -> istaskdone(server_task), 30.0) === :ok
+    close(client)
+    close(server)
+    @test timedwait(() -> istaskdone(writer), 30.0) === :ok
+end

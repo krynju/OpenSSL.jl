@@ -32,10 +32,54 @@ end
 bio_set_read_retry(bio::BIO) = bio_set_flags(bio, BIO_FLAGS_READ | BIO_FLAGS_SHOULD_RETRY)
 bio_clear_flags(bio::BIO) = bio_set_flags(bio, 0x00)
 
+"""
+    What the read and write BIOs of an `SSLStream` are given as their data.
+
+OpenSSL calls the write BIO from inside `SSL_write_ex`, `SSL_connect`, `SSL_accept`
+and `SSL_shutdown`, all of which run with `ssl.lock` held, and `SSL_read_ex` needs that
+same lock. Writing to the socket in the callback therefore blocks every read on the
+connection for as long as the peer's receive window stays full, which deadlocks any
+traffic that saturates both directions at once. The callback only buffers, and
+`drain!` moves the ciphertext to the socket afterwards, outside `ssl.lock`.
+"""
+mutable struct BIOStreamData
+    io::TCPSocket
+    # ciphertext produced by OpenSSL that has not reached the socket yet
+    buf::Vector{UInt8}
+    # held only to append to or swap out `buf`, never across a socket write
+    buflock::ReentrantLock
+    # serializes the socket writes so records leave in the order OpenSSL made them
+    drainlock::ReentrantLock
+end
+
+BIOStreamData(io::TCPSocket) = BIOStreamData(io, UInt8[], ReentrantLock(), ReentrantLock())
+
+"""
+    Writes whatever OpenSSL has produced to the socket. Must be called without
+    `ssl.lock` held. Returns without waiting for the socket when there is nothing to
+    write, so a reader never waits behind a writer that is blocked on the peer.
+"""
+function drain!(data::BIOStreamData)
+    Base.@lock(data.buflock, isempty(data.buf)) && return nothing
+    Base.@lock data.drainlock begin
+        while true
+            chunk = Base.@lock data.buflock begin
+                isempty(data.buf) && break
+                pending = data.buf
+                data.buf = UInt8[]
+                pending
+            end
+            GC.@preserve chunk unsafe_write(data.io, pointer(chunk), UInt(length(chunk)))
+        end
+    end
+    return nothing
+end
+
 function on_bio_stream_read(bio::BIO, out::Ptr{Cchar}, outlen::Cint)
     try
         bio_clear_flags(bio)
-        io = bio_get_data(bio)::TCPSocket
+        data = bio_get_data(bio)
+        io = data isa BIOStreamData ? data.io : data::IO
         n = bytesavailable(io)
         if n == 0
             bio_set_read_retry(bio)
@@ -51,8 +95,17 @@ end
 
 function on_bio_stream_write(bio::BIO, in::Ptr{Cchar}, inlen::Cint)::Cint
     try
-        io = bio_get_data(bio)::TCPSocket
-        written = unsafe_write(io, in, inlen)
+        data = bio_get_data(bio)
+        if data isa BIOStreamData
+            # buffer only; `drain!` writes to the socket once `ssl.lock` is free
+            Base.@lock data.buflock begin
+                n = length(data.buf)
+                resize!(data.buf, n + inlen)
+                GC.@preserve data unsafe_copyto!(pointer(data.buf, n + 1), Ptr{UInt8}(in), UInt(inlen))
+            end
+            return inlen
+        end
+        written = unsafe_write(data::IO, in, inlen)
         return Cint(written)
     catch e
         # we don't want to throw a Julia exception from a C callback
@@ -412,13 +465,16 @@ mutable struct SSLStream <: IO
     peekbuf::Base.RefValue{UInt8}
     peekbytes::Base.RefValue{Csize_t}
     closed::Bool
+    # buffers the ciphertext the BIO callbacks produce, see `BIOStreamData`
+    data::BIOStreamData
 
     function SSLStream(ssl_context::SSLContext, io::TCPSocket)
         # Create a read and write BIOs.
-        bio_read::BIO = BIO(io; finalize=false)
-        bio_write::BIO = BIO(io; finalize=false)
+        data = BIOStreamData(io)
+        bio_read::BIO = BIO(data; finalize=false)
+        bio_write::BIO = BIO(data; finalize=false)
         ssl = SSL(ssl_context, bio_read, bio_write)
-        x = new(ssl, ssl_context, bio_read, bio_write, io, ReentrantLock(), ReentrantLock(), Ref{Csize_t}(0), Ref{Csize_t}(0), Ref{UInt8}(0x00), Ref{Csize_t}(0), false)
+        x = new(ssl, ssl_context, bio_read, bio_write, io, ReentrantLock(), ReentrantLock(), Ref{Csize_t}(0), Ref{Csize_t}(0), Ref{UInt8}(0x00), Ref{Csize_t}(0), false, data)
         finalizer(close, x)
         return x
     end
@@ -428,6 +484,8 @@ SSLStream(tcp::TCPSocket) = SSLStream(SSLContext(OpenSSL.TLSClientMethod()), tcp
 
 # backwards compat
 Base.getproperty(ssl::SSLStream, nm::Symbol) = nm === :bio_read_stream ? ssl : getfield(ssl, nm)
+
+drain!(ssl::SSLStream) = drain!(getfield(ssl, :data))
 
 Base.isreadable(ssl::SSLStream)::Bool = isopen(ssl) && isreadable(ssl.io)
 Base.isopen(ssl::SSLStream)::Bool = Base.@lock(ssl.lock, !ssl.closed)
@@ -493,6 +551,9 @@ function Base.unsafe_write(ssl::SSLStream, in_buffer::Ptr{UInt8}, in_length::UIn
             in_length,
             ssl.writebytes
         )
+        # the write BIO only buffers, so this is where the socket write happens, and
+        # the caller waits for the peer here rather than under `ssl.lock`
+        drain!(ssl)
         if ret == SSL_ERROR_NONE
             nwritten += ssl.writebytes[]
         elseif ret == SSL_ERROR_WANT_WRITE
@@ -509,6 +570,7 @@ end
 function Sockets.connect(ssl::SSLStream; require_ssl_verification::Bool=true)
     while true
         ret = @geterror ssl :connect ssl_connect(ssl.ssl)
+        drain!(ssl)
         if ret == SSL_ERROR_NONE
             break
         elseif ret == SSL_ERROR_WANT_READ
@@ -574,7 +636,12 @@ function hostname!(ssl::SSLStream, host)
 end
 
 function Sockets.accept(ssl::SSLStream)
-    ssl_accept(ssl.ssl)
+    try
+        ssl_accept(ssl.ssl)
+    finally
+        # the server hello the handshake produced is still in the write buffer
+        drain!(ssl)
+    end
 end
 
 """
@@ -593,6 +660,7 @@ function Base.unsafe_read(ssl::SSLStream, buf::Ptr{UInt8}, nbytes::UInt)
             nbytes - nread,
             readbytes
         )
+        drain!(ssl)
         if ret == SSL_ERROR_NONE
             nread += Base.bitcast(Int, readbytes[])
         elseif ret == SSL_ERROR_WANT_READ
@@ -677,6 +745,7 @@ function Base.eof(ssl::SSLStream)::Bool
                 1,
                 ssl.peekbytes
             )
+            drain!(ssl)
             if ret == SSL_ERROR_NONE
                 return false
             elseif ret == SSL_ERROR_WANT_WRITE
@@ -708,6 +777,13 @@ function Base.close(ssl::SSLStream, shutdown::Bool=true)
             end
         end
         free(ssl.ssl)
+    end
+    if shutdown
+        try
+            drain!(ssl)
+        catch err
+            @debug "SSL close_notify not sent" err
+        end
     end
     @async try
         Base.close(ssl.io)
