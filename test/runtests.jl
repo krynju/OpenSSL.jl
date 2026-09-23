@@ -106,14 +106,25 @@ end
     start_line = "==========\n"
     certs_pem = split(file_content, start_line; keepempty=false)
 
-    cert = certs_pem[2]
-
-    x509_cert = X509Certificate(cert)
+    # the bundle is Mozilla's root list and its order changes with it, so pick a
+    # certificate that carries the fields under test rather than trusting an index
+    has_ou(cert) = occursin("/OU=", String(cert.subject_name))
+    x509_cert = nothing
+    for pem in certs_pem
+        occursin("-----BEGIN CERTIFICATE-----", pem) || continue
+        candidate = X509Certificate(pem)
+        if has_ou(candidate)
+            x509_cert = candidate
+            break
+        end
+    end
+    @test x509_cert !== nothing
 
     @test occursin("/C=", String(x509_cert.subject_name))
     @test occursin("/OU=", String(x509_cert.subject_name))
     @test  occursin("/CN=", String(x509_cert.subject_name))
 
+    # the roots in the bundle are self signed, so the issuer carries the same fields
     @test occursin("/C=", String(x509_cert.issuer_name))
     @test occursin("/OU=", String(x509_cert.issuer_name))
     @test  occursin("/CN=", String(x509_cert.issuer_name))
