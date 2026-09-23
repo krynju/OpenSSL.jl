@@ -485,7 +485,17 @@ SSLStream(tcp::TCPSocket) = SSLStream(SSLContext(OpenSSL.TLSClientMethod()), tcp
 # backwards compat
 Base.getproperty(ssl::SSLStream, nm::Symbol) = nm === :bio_read_stream ? ssl : getfield(ssl, nm)
 
-drain!(ssl::SSLStream) = drain!(getfield(ssl, :data))
+function drain!(ssl::SSLStream)
+    try
+        drain!(getfield(ssl, :data))
+    catch
+        # a failed socket write used to surface through the BIO callback as an SSL
+        # error, which closed the stream; keep that so `isopen` does not report a
+        # connection whose ciphertext never reached the peer as usable
+        close(ssl, false)
+        rethrow()
+    end
+end
 
 Base.isreadable(ssl::SSLStream)::Bool = isopen(ssl) && isreadable(ssl.io)
 Base.isopen(ssl::SSLStream)::Bool = Base.@lock(ssl.lock, !ssl.closed)
@@ -539,16 +549,23 @@ macro geterror(ssl, op, expr)
     end)
 end
 
+# the write BIO buffers the whole output of one `SSL_write_ex` before `drain!` moves it
+# to the socket, so cap how much plaintext goes into a single call to bound that buffer
+const SSL_WRITE_CHUNK = UInt(1 << 20)
+
 function Base.unsafe_write(ssl::SSLStream, in_buffer::Ptr{UInt8}, in_length::UInt)
     nwritten = 0
     while nwritten < in_length
+        # SSL_write_ex writes all or nothing without SSL_MODE_ENABLE_PARTIAL_WRITE, so a
+        # retry after WANT_READ/WANT_WRITE resubmits the same chunk
+        chunk = min(in_length - nwritten, SSL_WRITE_CHUNK)
         ret = @geterror ssl :unsafe_write ccall(
             (:SSL_write_ex, libssl),
             Cint,
-            (SSL, Ptr{Cvoid}, Cint, Ptr{Csize_t}),
+            (SSL, Ptr{Cvoid}, Csize_t, Ptr{Csize_t}),
             ssl.ssl,
-            in_buffer,
-            in_length,
+            in_buffer + nwritten,
+            chunk,
             ssl.writebytes
         )
         # the write BIO only buffers, so this is where the socket write happens, and
@@ -780,7 +797,7 @@ function Base.close(ssl::SSLStream, shutdown::Bool=true)
     end
     if shutdown
         try
-            drain!(ssl)
+            drain!(getfield(ssl, :data))
         catch err
             @debug "SSL close_notify not sent" err
         end
