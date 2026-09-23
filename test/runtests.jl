@@ -688,15 +688,27 @@ end
         Sockets.connect(ip"127.0.0.1", port))
     Sockets.connect(client; require_ssl_verification=false)
 
+    # keep writing until the peer's receive window is full and the writer parks: how
+    # much that takes depends on the platform's socket buffers
+    stop_writing = Threads.Atomic{Bool}(false)
+    written = Threads.Atomic{Int}(0)
+    chunk = zeros(UInt8, 1024 * 1024)
     writer = @async try
-        write(client, zeros(UInt8, 8 * 1024 * 1024))
+        while !stop_writing[]
+            write(client, chunk)
+            Threads.atomic_add!(written, length(chunk))
+        end
     catch ex
         ex
     end
-    # give the writer time to fill the peer's receive window and park there
-    sleep(1.0)
-    @test !istaskdone(writer)
-    @test !islocked(client.lock)
+    parked = timedwait(60.0; pollint=0.5) do
+        before = written[]
+        sleep(0.5)
+        !istaskdone(writer) && written[] == before
+    end
+    @test parked === :ok
+    # the write waits for the socket without holding the lock reads need
+    @test timedwait(() -> !islocked(client.lock), 5.0) === :ok
 
     buff = Vector{UInt8}(undef, length(payload))
     reader = @async try
@@ -709,6 +721,7 @@ end
 
     # the server has to go away first: the client still has 8 MB parked against a peer
     # that is not reading, so its own close cannot finish until that write fails
+    stop_writing[] = true
     put!(stop, nothing)
     @test timedwait(() -> istaskdone(server_task), 30.0) === :ok
     close(client)
